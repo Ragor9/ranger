@@ -1,6 +1,8 @@
 # Ranger
 
-Widget para Windows que mostra a bateria dos dispositivos sem fio: o mouse Attack Shark X11 (lido direto do receptor, sem enviar nada ao mouse) e qualquer dispositivo Bluetooth que informe bateria ao Windows (fones, controles, teclados).
+Widget para Windows que mostra a bateria dos dispositivos sem fio: o mouse Attack Shark X11 (lido direto do receptor, sem enviar nada ao mouse), mouses 2.4 GHz com receptor Compx (VID `25A7`, ex.: Redragon M808-KS — o Ranger pergunta a bateria ao receptor a cada minuto, em passos de 10 %) e qualquer dispositivo Bluetooth que informe bateria ao Windows (fones, controles, teclados).
+
+Com dois monitores, o modo flutuante fica na borda que não encosta em outra tela.
 
 ## Modos de exibição
 
