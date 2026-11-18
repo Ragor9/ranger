@@ -149,6 +149,7 @@ namespace Ranger
 
         readonly Settings cfg = Settings.Load();
         readonly X11Provider x11 = new X11Provider();
+        readonly CompxProvider compx = new CompxProvider();
         readonly string snapshotBase, dumpPath, forcedTheme;
         Theme th, tbTh;
         readonly Theme nth = Theme.Notch();
@@ -220,6 +221,7 @@ namespace Ranger
             };
             Loaded += delegate {
                 x11.Start();
+                compx.Start();
                 if (snapshotBase != null || dumpPath != null) { RunCapture(); return; }
                 Refresh(true);
                 tick.Start();
@@ -524,14 +526,15 @@ namespace Ranger
         void Position()
         {
             if (Capturing) { Left = -20000; Top = 0; return; }
-            Rect wa = SystemParameters.WorkArea;
             if (IsNotch)
             {
-                Left = Math.Round(wa.Left + (wa.Width - Width) / 2);
-                Top = wa.Top;
+                Rect pa = SystemParameters.WorkArea;
+                Left = Math.Round(pa.Left + (pa.Width - Width) / 2);
+                Top = pa.Top;
                 return;
             }
             if (IsTaskbar) { PositionTaskbar(); return; }
+            Rect wa = FloatArea();
             Left = Right ? wa.Right - Width : wa.Left;
             double cy = wa.Top + cfg.CenterY * wa.Height;
             Top = Math.Max(wa.Top, Math.Min(wa.Bottom - Height, cy - Height / 2));
@@ -654,7 +657,7 @@ namespace Ranger
             }
             if (!dragging && Math.Abs(p.Y - dragStart.Y) < 3) return;
             dragging = true;
-            Rect wa = SystemParameters.WorkArea;
+            Rect wa = FloatArea();
             Top = Math.Max(wa.Top - Height / 2 + 40, Math.Min(wa.Bottom - Height / 2 - 40, Top + p.Y - dragStart.Y));
         }
 
@@ -677,7 +680,7 @@ namespace Ranger
                 Position();
                 return;
             }
-            Rect wa = SystemParameters.WorkArea;
+            Rect wa = FloatArea();
             cfg.CenterY = Math.Max(0, Math.Min(1, (Top + Height / 2 - wa.Top) / wa.Height));
             cfg.Save();
             Position();
@@ -743,6 +746,7 @@ namespace Ranger
             var list = new List<DeviceState>();
             var m = x11.Snapshot();
             if (m != null) list.Add(m);
+            list.AddRange(compx.Snapshot());
             foreach (var d in bt)
             {
                 // Se o X11 estiver em modo Bluetooth, não duplica.
@@ -1020,6 +1024,8 @@ namespace Ranger
         [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr h, StringBuilder sb, int n);
         [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr FindWindow(string cls, string title);
         [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr FindWindowEx(IntPtr parent, IntPtr after, string cls, string title);
+        [DllImport("user32.dll")] static extern bool EnumDisplayMonitors(IntPtr hdc, IntPtr clip, MonitorEnumProc proc, IntPtr data);
+        delegate bool MonitorEnumProc(IntPtr m, IntPtr hdc, ref RECT r, IntPtr data);
         [StructLayout(LayoutKind.Sequential)] struct RECT { public int L, T, R, B; }
         [StructLayout(LayoutKind.Sequential)] struct MONITORINFO { public int cbSize; public RECT rcMonitor, rcWork; public int dwFlags; }
 
@@ -1037,6 +1043,50 @@ namespace Ranger
             if (src != null && src.CompositionTarget != null) m = src.CompositionTarget.TransformFromDevice;
             Point a = m.Transform(new Point(r.L, r.T)), b = m.Transform(new Point(r.R, r.B));
             return new Rect(a, b);
+        }
+
+        // Área de trabalho usada pelo modo flutuante. Com vários monitores, a borda escolhida
+        // do monitor principal pode encostar em outro monitor: aí o traço fica na divisa, o
+        // mouse passa direto para a outra tela e o painel nunca abre. Nesse caso usa o monitor
+        // cuja borda daquele lado é livre (prefere o principal; senão, o mais externo).
+        Rect FloatArea()
+        {
+            var mons = new List<MONITORINFO>();
+            EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, delegate (IntPtr m, IntPtr hdc, ref RECT r, IntPtr d)
+            {
+                var mi = new MONITORINFO { cbSize = Marshal.SizeOf(typeof(MONITORINFO)) };
+                if (GetMonitorInfo(m, ref mi)) mons.Add(mi);
+                return true;
+            }, IntPtr.Zero);
+            if (mons.Count < 2) return SystemParameters.WorkArea;
+
+            bool right = Right;
+            MONITORINFO best = default(MONITORINFO);
+            bool found = false;
+            foreach (var a in mons)
+            {
+                bool blocked = false;
+                foreach (var b in mons)
+                {
+                    if (b.rcMonitor.L == a.rcMonitor.L && b.rcMonitor.T == a.rcMonitor.T) continue;
+                    bool overlapY = b.rcMonitor.T < a.rcMonitor.B && b.rcMonitor.B > a.rcMonitor.T;
+                    bool touches = right ? Math.Abs(b.rcMonitor.L - a.rcMonitor.R) <= 1 : Math.Abs(b.rcMonitor.R - a.rcMonitor.L) <= 1;
+                    if (overlapY && touches) { blocked = true; break; }
+                }
+                if (blocked) continue;
+                bool primary = (a.dwFlags & 1) != 0;
+                bool bestPrimary = found && (best.dwFlags & 1) != 0;
+                bool outer = !found || (right ? a.rcMonitor.R > best.rcMonitor.R : a.rcMonitor.L < best.rcMonitor.L);
+                if (!found || (primary && !bestPrimary) || (!bestPrimary && outer)) { best = a; found = true; }
+            }
+            if (!found) return SystemParameters.WorkArea;
+            if (PresentationSource.FromVisual(this) != null) return FromDevice(best.rcWork);
+            // Janela ainda sem handle: deduz a escala comparando o principal com a WorkArea do WPF.
+            double k = 1;
+            foreach (var a in mons)
+                if ((a.dwFlags & 1) != 0 && a.rcWork.R > a.rcWork.L) k = SystemParameters.WorkArea.Width / (a.rcWork.R - a.rcWork.L);
+            var w = best.rcWork;
+            return new Rect(w.L * k, w.T * k, (w.R - w.L) * k, (w.B - w.T) * k);
         }
 
         Rect TaskbarRect()

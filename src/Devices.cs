@@ -1,4 +1,5 @@
-// Leitura de bateria: Attack Shark X11 (HID passivo) e dispositivos Bluetooth (propriedades do Windows).
+// Leitura de bateria: Attack Shark X11 (HID passivo), receptores 2.4 GHz Compx (consulta HID)
+// e dispositivos Bluetooth (propriedades do Windows).
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -84,6 +85,20 @@ namespace Ranger
         {
             return CreateFile(path, read ? 0x80000000u : 0u, 3, IntPtr.Zero, 3, 0, IntPtr.Zero);
         }
+
+        // Leitura com I/O assíncrono (permite esperar com tempo-limite) ou leitura+escrita para feature reports.
+        public static SafeFileHandle OpenAsyncRead(string path)
+        {
+            return CreateFile(path, 0x80000000u, 3, IntPtr.Zero, 3, 0x40000000u, IntPtr.Zero); // FILE_FLAG_OVERLAPPED
+        }
+
+        public static SafeFileHandle OpenReadWrite(string path)
+        {
+            return CreateFile(path, 0x80000000u | 0x40000000u, 3, IntPtr.Zero, 3, 0, IntPtr.Zero);
+        }
+
+        [DllImport("hid.dll")] static extern bool HidD_SetFeature(SafeFileHandle h, byte[] b, int n);
+        public static bool SetFeature(SafeFileHandle h, byte[] report) { return HidD_SetFeature(h, report, report.Length); }
 
         static void InputIds(ushort nValue, ushort nButton, IntPtr pp, List<byte> into)
         {
@@ -261,6 +276,159 @@ namespace Ranger
             if (sec < 3600) return "há " + (int)(sec / 60) + " min";
             if (sec < 86400) return "há " + (int)(sec / 3600) + " h";
             return "há " + (int)(sec / 86400) + " d";
+        }
+    }
+
+    // ---------------------------------------------------- receptores Compx
+    // Receptores 2.4 GHz com chip Compx (VID 25A7), usados por várias marcas (ex.: Redragon M808-KS).
+    // O receptor só responde quando perguntado:
+    //   pedido   (feature id 8, 17 bytes, página 0xFF02): 08 04 00 00 00 00 … chk
+    //   resposta (input   id 9, 17 bytes, página 0xFF01): 09 04 <estado> 00 00 <n> <nível> <b7> … chk
+    // estado 00 = ok (01 = recusado/sem resposta do mouse); nível 0–10 = dezenas de %.
+    // chk faz os 17 bytes somarem 0x55. O comando 04 só lê; nada é gravado no mouse.
+    // O receptor é reconhecido pelo formato dos canais, não por um PID específico.
+    public class CompxProvider
+    {
+        const ushort Vid = 0x25A7;
+        const int Len = 17;
+        const double PollSec = 60, RetrySec = 10;
+        readonly object gate = new object();
+        readonly Dictionary<string, Entry> entries = new Dictionary<string, Entry>();
+
+        class Entry { public string Name; public int Percent = -1; public DateTime Last = DateTime.MinValue; public bool Present; }
+
+        // Modelos conhecidos (PID do receptor → nome); os demais aparecem com um nome genérico.
+        static string ModelName(ushort pid)
+        {
+            switch (pid)
+            {
+                case 0xFA07: case 0xFA08: return "Redragon M808-KS";
+                default: return "Mouse 2.4 GHz";
+            }
+        }
+
+        public void Start()
+        {
+            var t = new Thread(Loop); t.IsBackground = true; t.Name = "compx"; t.Start();
+        }
+
+        // Agrupa as coleções do mesmo receptor (os canais de pedido e resposta podem ficar em interfaces diferentes).
+        static string DeviceKey(Hid.Collection c) { return "pid_" + c.Pid.ToString("x4"); }
+
+        void Loop()
+        {
+            while (true)
+            {
+                bool any = false;
+                try
+                {
+                    var cols = Hid.Enumerate(Vid);
+                    var seen = new HashSet<string>();
+                    var groups = new Dictionary<string, Hid.Collection[]>(); // [0] pedido, [1] resposta
+                    foreach (var c in cols)
+                    {
+                        if (c.Vid != Vid || c.UsagePage < 0xFF00) continue;
+                        string k = DeviceKey(c);
+                        Hid.Collection[] g;
+                        if (!groups.TryGetValue(k, out g)) groups[k] = g = new Hid.Collection[2];
+                        if (c.FeatLen == Len && c.InLen == 0) g[0] = c;
+                        else if (c.InLen == Len && c.InputIds.Contains(0x09)) g[1] = c;
+                    }
+                    foreach (var kv in groups)
+                    {
+                        var g = kv.Value;
+                        if (g[0] == null || g[1] == null) continue;
+                        any = true; seen.Add(kv.Key);
+                        int level = Query(g[0].Path, g[1].Path);
+                        lock (gate)
+                        {
+                            Entry e;
+                            if (!entries.TryGetValue(kv.Key, out e)) entries[kv.Key] = e = new Entry { Name = ModelName(g[0].Pid) };
+                            e.Present = true;
+                            if (level >= 0) { e.Percent = Math.Min(100, level * 10); e.Last = DateTime.UtcNow; }
+                        }
+                    }
+                    lock (gate) foreach (var kv in entries) if (!seen.Contains(kv.Key)) kv.Value.Present = false;
+                }
+                catch (Exception) { }
+                Thread.Sleep(TimeSpan.FromSeconds(any ? PollSec : RetrySec));
+            }
+        }
+
+        static byte[] Request()
+        {
+            var b = new byte[Len];
+            b[0] = 0x08; b[1] = 0x04;
+            int sum = 0; for (int i = 0; i < Len - 1; i++) sum += b[i];
+            b[Len - 1] = (byte)(0x55 - sum);
+            return b;
+        }
+
+        static bool Valid(byte[] b, int n)
+        {
+            if (n < Len || b[0] != 0x09 || b[1] != 0x04) return false;
+            int sum = 0; for (int i = 0; i < Len; i++) sum += b[i];
+            return (sum & 0xFF) == 0x55;
+        }
+
+        // Pergunta a bateria e espera a resposta. Devolve o nível (0–10) ou -1.
+        static int Query(string reqPath, string inPath)
+        {
+            using (var ih = Hid.OpenAsyncRead(inPath))
+            using (var fh = Hid.OpenReadWrite(reqPath))
+            {
+                if (ih.IsInvalid || fh.IsInvalid) return -1;
+                using (var fs = new FileStream(ih, FileAccess.Read, Len, true))
+                {
+                    var buf = new byte[Len];
+                    for (int attempt = 0; attempt < 3; attempt++)
+                    {
+                        // A leitura começa antes do pedido para não perder a resposta.
+                        IAsyncResult ar = fs.BeginRead(buf, 0, Len, null, null);
+                        if (!Hid.SetFeature(fh, Request())) { Cancel(ih, fs, ar); return -1; }
+                        DateTime until = DateTime.UtcNow.AddMilliseconds(800);
+                        while (true)
+                        {
+                            int left = (int)(until - DateTime.UtcNow).TotalMilliseconds;
+                            if (left <= 0 || !ar.AsyncWaitHandle.WaitOne(left)) { Cancel(ih, fs, ar); break; }
+                            int n = fs.EndRead(ar);
+                            if (Valid(buf, n))
+                            {
+                                if (buf[2] == 0x00 && buf[5] >= 1 && buf[6] <= 10) return buf[6];
+                                break; // recusado (ex.: mouse dormindo): tenta de novo
+                            }
+                            ar = fs.BeginRead(buf, 0, Len, null, null); // outro quadro (ex.: do software do fabricante)
+                        }
+                        Thread.Sleep(150);
+                    }
+                }
+            }
+            return -1;
+        }
+
+        static void Cancel(SafeFileHandle h, FileStream fs, IAsyncResult ar)
+        {
+            Hid.CancelIoEx(h, IntPtr.Zero);
+            try { fs.EndRead(ar); } catch (Exception) { }
+        }
+
+        public List<DeviceState> Snapshot()
+        {
+            var list = new List<DeviceState>();
+            lock (gate)
+            {
+                foreach (var kv in entries)
+                {
+                    var e = kv.Value;
+                    if (!e.Present || e.Percent < 0) continue;
+                    double age = (DateTime.UtcNow - e.Last).TotalSeconds;
+                    var s = new DeviceState { Key = "compx:" + kv.Key, Name = e.Name, Kind = Kind.Mouse, Percent = e.Percent };
+                    s.Stale = age > PollSec * 3;
+                    s.Detail = s.Stale ? "Sem sinal · " + X11Provider.Ago(age) : "2.4 GHz";
+                    list.Add(s);
+                }
+            }
+            return list;
         }
     }
 
